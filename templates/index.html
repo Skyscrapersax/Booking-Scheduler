@@ -1,19 +1,28 @@
-<head>
-    <title>{{ title }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='main.css') }}">
-
-<body>
-    <div class="App">
-        <header class="App-header">
-            <img src="{{ url_for('static', filename='Octocat.png') }}" class="App-logo" alt="logo" />
-            <p>
-                GitHub Codespaces <span class="heart">♥️</span> Flask
-            </p>
-            <p class="small">
-                Edit <code>templates/index.html</code> and refresh to see your changes!
-            </p>
-        </header>
-    </div>
-</body>
-
-</html>
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% if login %}Sign in{% else %}{{ day }}{% endif %} · Booking Scheduler</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='main.css') }}"></head>
+<body><a class="skip" href="#main">Skip to content</a>
+<header><a class="brand" href="/">Booking Scheduler<span>PRIVATE OPERATOR DESK</span></a>
+{% if not login %}<form action="/logout" method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><button class="quiet">Sign out</button></form>{% endif %}</header>
+<main id="main">
+{% if login %}
+<section class="signin"><p class="eyebrow">One calendar. A clear day.</p><h1>Welcome to the desk.</h1><p>Sign in to manage bookings. Client details stay private.</p>
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<form method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}"><label for="password">Operator password</label><input id="password" name="password" type="password" autocomplete="current-password" required><button>Open calendar</button></form></section>
+{% else %}
+<div class="heading"><div><p class="eyebrow">{{ zone }} · one shared calendar</p><h1>Your booking day.</h1></div><form class="day-picker" method="get"><label for="day">View date</label><div><input type="date" id="day" name="day" value="{{ day }}" required><button>Show day</button></div></form></div>
+{% for message in get_flashed_messages() %}<p class="notice" role="status">{{ message }}</p>{% endfor %}
+{% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+<div class="workspace"><section aria-labelledby="agenda-title"><div class="section-head"><h2 id="agenda-title">{{ day }}</h2><nav aria-label="Calendar days"><a href="/?day={{ previous }}">← Previous</a><a href="/?day={{ following }}">Next →</a></nav></div>
+{% for b in bookings %}<article class="booking {% if b.cancelled %}cancelled{% endif %}"><p class="time">{{ b.starts|localtime }}<br>to {{ b.ends|localtime }}</p><div><span class="badge">{{ 'Cancelled' if b.cancelled else 'Booked' }}</span><h3>{{ b.title }}</h3><p>{{ b.client }}{% if b.contact %} · {{ b.contact }}{% endif %}</p>{% if b.notes %}<p class="notes">{{ b.notes }}</p>{% endif %}<div class="actions"><a href="/bookings/{{ b.id }}.ics">Download calendar file</a>{% if not b.cancelled %}<form method="post" action="/bookings/{{ b.id }}/cancel"><input type="hidden" name="csrf" value="{{ session.csrf }}"><details><summary>Cancel booking</summary><p>This frees the slot and keeps its history.</p><button class="danger">Confirm cancellation</button></details></form>{% endif %}</div></div></article>
+{% else %}<div class="empty"><p class="eyebrow">Time available</p><h3>A clear calendar.</h3><p>No bookings for this day. Add the first session using the form.</p></div>{% endfor %}
+</section><aside><h2>Add a booking</h2><p class="hint">Times use {{ zone }}. Overlapping sessions cannot be saved.</p>
+<form method="post" action="/bookings"><input type="hidden" name="csrf" value="{{ session.csrf }}"><input type="hidden" name="request_id" value="{{ request_id }}"><input type="hidden" name="day" value="{{ day }}">
+<label for="title">Session title</label><input id="title" name="title" maxlength="120" value="{{ values.get('title', '') }}" placeholder="Recording session" required>
+<label for="client">Client name</label><input id="client" name="client" maxlength="120" autocomplete="name" value="{{ values.get('client', '') }}" required>
+<label for="contact">Contact <span>(optional)</span></label><input id="contact" name="contact" maxlength="200" value="{{ values.get('contact', '') }}" placeholder="Email or phone">
+<label for="start">Start date and time</label><input id="start" name="start" type="datetime-local" value="{{ values.get('start', suggested) }}" required>
+<label for="minutes">Duration</label><select id="minutes" name="minutes">{% for n in [15,30,45,60,90,120,180,240,480] %}<option value="{{ n }}" {% if values.get('minutes','60') == n|string %}selected{% endif %}>{{ n }} minutes</option>{% endfor %}</select>
+<label for="notes">Notes <span>(optional)</span></label><textarea id="notes" name="notes" maxlength="2000" rows="3">{{ values.get('notes', '') }}</textarea><button>Save booking</button><p class="hint">Saves to this desk. Calendar download is manual; no email, invitation, or payment is sent.</p></form></aside></div>
+{% endif %}</main><footer>Booking Scheduler · private pilot · single calendar</footer></body></html>
