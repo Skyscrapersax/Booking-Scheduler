@@ -29,6 +29,9 @@ Bookings must start in the future, within one year. Durations mean elapsed time.
 `BOOKING_DATABASE` selects the SQLite file; default `instance/bookings.sqlite3`.
 Keep the same DB path and secret across restarts. Storage is excluded from Git.
 Tests use temporary databases; no real appointments or contacts are needed.
+At startup, the app enforces mode `0600` on the main database file. Keep its parent
+directory private, including custom paths; existing directory and SQLite sidecar
+permissions are not changed by the app.
 
 ## Pilot boundary
 
@@ -51,10 +54,12 @@ Use SQLite's backup API for live backups (copying only the main file while WAL
 is active can omit recent writes). Example using an existing DB path:
 
 ```sh
+umask 077
 python3 -c 'import sqlite3; source=sqlite3.connect("instance/bookings.sqlite3"); target=sqlite3.connect("/private/backup/bookings.sqlite3"); source.backup(target); target.close(); source.close()'
 ```
 
-Protect backups like client data. Restore a backup into a separate pilot instance
+Use a private backup directory and a new target file; `umask` does not tighten an
+existing file's permissions. Protect backups like client data. Restore a backup into a separate pilot instance
 and verify bookings before adopting it. Automated backups, restore drills and
 production hosting are not configured by this change.
 
@@ -70,7 +75,7 @@ validation: workflow 20/25, safety 14/20, UX 12/15, operations 8/15,
 verification 13/15, commercial evidence 3/10. No prior numeric score was verified;
 the original implementation only rendered the Codespaces welcome screen.
 
-Eight standard-library tests cover persistence/restart, replay, cancellation and
+Nine standard-library tests cover existing database permissions, persistence/restart, replay, cancellation and
 rebooking, atomic concurrency, adjacent versus overlapping slots, auth/CSRF/host
 checks, invalid input, DST, HTML escaping and ICS injection/UTF-8 line folding.
 Dependency resolution passes `pip check`; no vulnerability-audit result is claimed.

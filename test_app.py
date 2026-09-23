@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 import tempfile
 import unittest
 from zoneinfo import ZoneInfo
@@ -114,6 +116,13 @@ class BookingTest(unittest.TestCase):
     def test_missing_credentials_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "BOOKING_SECRET"):
             create_app(self.config | {"SECRET_KEY": "", "ADMIN_PASSWORD": ""})
+
+    def test_existing_database_is_made_owner_only(self):
+        database = Path(self.temp.name) / "existing.sqlite3"
+        database.touch()
+        os.chmod(database, 0o644)
+        create_app(self.config | {"DATABASE": str(database)})
+        self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
 
 
 if __name__ == "__main__":
