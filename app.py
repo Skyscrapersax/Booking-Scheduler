@@ -2,11 +2,13 @@
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hmac
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import secrets
-import sqlite3
+from database import connect, transaction, initialize, validate, DatabaseError
 from zoneinfo import ZoneInfo
 
 from flask import Flask, Response, abort, flash, redirect, render_template, request, session, url_for
@@ -47,37 +49,47 @@ def create_app(config=None):
     app = Flask(__name__, instance_relative_config=True)
     app.config.from_mapping(
         SECRET_KEY=os.environ.get("BOOKING_SECRET", ""), ADMIN_PASSWORD=os.environ.get("BOOKING_PASSWORD", ""),
-        DATABASE=os.environ.get("BOOKING_DATABASE", str(Path(app.instance_path) / "bookings.sqlite3")),
+        DATABASE=os.environ.get("BOOKING_DATABASE_URL") or os.environ.get("DATABASE_URL") or os.environ.get("BOOKING_DATABASE", str(Path(app.instance_path) / "bookings.sqlite3")),
         TIMEZONE=os.environ.get("BOOKING_TIMEZONE", "America/New_York"),
         SESSION_COOKIE_NAME="booking_desk_session", SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=os.environ.get("BOOKING_COOKIE_SECURE") != "0",
         PERMANENT_SESSION_LIFETIME=timedelta(hours=8), MAX_CONTENT_LENGTH=16384,
-        TRUSTED_HOSTS=["localhost", "127.0.0.1"] + ([os.environ["BOOKING_HOST"]] if os.environ.get("BOOKING_HOST") else []),
+        TRUSTED_HOSTS=["localhost", "127.0.0.1"] + [os.environ[k] for k in ("BOOKING_HOST", "VERCEL_URL", "VERCEL_BRANCH_URL", "VERCEL_PROJECT_PRODUCTION_URL") if os.environ.get(k)],
+        LOGIN_LIMIT=10, HOSTED=bool(os.environ.get("VERCEL")), AUTO_MIGRATE=True,
     )
     app.config.update(config or {})
     if len(app.config["SECRET_KEY"]) < 32 or len(app.config["ADMIN_PASSWORD"]) < 16:
         raise ValueError("Set BOOKING_SECRET (32+ characters) and BOOKING_PASSWORD (16+ characters).")
     password_hash = generate_password_hash(app.config.pop("ADMIN_PASSWORD"))
     zone = ZoneInfo(app.config["TIMEZONE"])
-    database = Path(app.config["DATABASE"])
-    database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    database.touch(mode=0o600, exist_ok=True)
-    database.chmod(0o600)
+    database = app.config["DATABASE"]
+    postgres = str(database).startswith(("postgres://", "postgresql://"))
+    if app.config["HOSTED"] and (not postgres or not app.config["SESSION_COOKIE_SECURE"]):
+        raise ValueError("Vercel requires DATABASE_URL for PostgreSQL and secure cookies.")
+    if not postgres:
+        database = Path(database)
+        database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        database.touch(mode=0o600, exist_ok=True)
+        database.chmod(0o600)
 
     def db():
-        conn = sqlite3.connect(database, timeout=10)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return connect(database)
 
     with closing(db()) as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""CREATE TABLE IF NOT EXISTS bookings (
+        schema = """CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY, title TEXT NOT NULL, client TEXT NOT NULL,
             contact TEXT NOT NULL, notes TEXT NOT NULL, starts INTEGER NOT NULL,
             ends INTEGER NOT NULL CHECK(ends > starts), created INTEGER NOT NULL,
-            cancelled INTEGER, request_id TEXT NOT NULL UNIQUE)""")
-        conn.execute("CREATE INDEX IF NOT EXISTS booking_times ON bookings(starts, ends) WHERE cancelled IS NULL")
-        conn.commit()
+            cancelled INTEGER, request_id TEXT NOT NULL UNIQUE);
+            CREATE INDEX IF NOT EXISTS booking_times ON bookings(starts, ends) WHERE cancelled IS NULL;"""
+        initialize(conn, schema) if app.config["AUTO_MIGRATE"] else validate(conn)
+
+    def now():
+        return int(datetime.now(timezone.utc).timestamp())
+
+    def record_change(conn, row, action):
+        conn.execute("INSERT INTO booking_history(booking_id,action,changed,snapshot) VALUES(?,?,?,?)",
+                     (row["id"], action, now(), json.dumps(dict(row))))
 
     @app.before_request
     def protect():
@@ -86,7 +98,18 @@ def create_app(config=None):
         session.setdefault("csrf", secrets.token_urlsafe(32))
         if request.method == "POST" and not hmac.compare_digest(session["csrf"].encode(), request.form.get("csrf", "").encode()):
             abort(400, "Form expired. Reload the page and try again.")
-        if request.endpoint not in {"login", "static"} and not session.get("signed_in"):
+        if request.method == "POST" and request.endpoint == "login":
+            address = request.remote_addr or "unknown"
+            if os.environ.get("VERCEL"):
+                address = request.headers.get("x-vercel-forwarded-for", address).split(",")[0].strip()
+            bucket = hmac.new(app.config["SECRET_KEY"].encode(), address.encode(), hashlib.sha256).hexdigest()
+            with closing(db()) as conn, transaction(conn):
+                conn.execute("DELETE FROM limits WHERE resets <= ?", (now(),))
+                row = conn.execute("SELECT count FROM limits WHERE bucket=?", (bucket,)).fetchone()
+                if row and row["count"] >= app.config["LOGIN_LIMIT"]:
+                    abort(429, "Too many sign-in attempts. Try again in 15 minutes.")
+                conn.execute("INSERT INTO limits VALUES(?,1,?) ON CONFLICT(bucket) DO UPDATE SET count=limits.count+1", (bucket, now()+900))
+        if request.endpoint not in {"login", "static", "health"} and not session.get("signed_in"):
             return redirect(url_for("login"))
 
     @app.after_request
@@ -116,8 +139,8 @@ def create_app(config=None):
         session.clear()
         return redirect(url_for("login"), code=303)
 
-    def desk(error=None, status=200):
-        day = request.args.get("day") or request.form.get("day") or datetime.now(zone).date().isoformat()
+    def desk(error=None, status=200, editing=None):
+        day = request.args.get("day") or request.form.get("day") or (datetime.fromtimestamp(editing["starts"], zone).date().isoformat() if editing else datetime.now(zone).date().isoformat())
         try:
             date = datetime.strptime(day, "%Y-%m-%d").date()
             if not 2000 <= date.year <= 2100:
@@ -130,37 +153,42 @@ def create_app(config=None):
             bookings = conn.execute("SELECT * FROM bookings WHERE starts < ? AND ends > ? ORDER BY starts, id", (end, start)).fetchall()
         now = datetime.now(zone)
         suggested = (now + timedelta(minutes=15 - now.minute % 15)).strftime("%Y-%m-%dT%H:%M") if date == now.date() else date.isoformat() + "T10:00"
-        return render_template("index.html", day=date.isoformat(), bookings=bookings, zone=zone.key,
+        values = request.form
+        if editing and request.method == "GET":
+            values = dict(editing) | {"start": datetime.fromtimestamp(editing["starts"], zone).strftime("%Y-%m-%dT%H:%M"), "minutes": str((editing["ends"]-editing["starts"])//60)}
+        return render_template("index.html", day=date.isoformat(), bookings=bookings, zone=zone.key, editing=editing,
             previous=(date-timedelta(days=1)).isoformat(), following=(date+timedelta(days=1)).isoformat(),
-            error=error, values=request.form, suggested=suggested, request_id=request.form.get("request_id") or secrets.token_urlsafe(24)), status
+            error=error, values=values, suggested=suggested, request_id=request.form.get("request_id") or secrets.token_urlsafe(24)), status
 
     @app.get("/")
     def index():
         return desk()
 
+    def booking_values():
+        values = {key: request.form.get(key, "").strip() for key in ("title", "client", "contact", "notes", "request_id")}
+        for key, limit in [("title", 120), ("client", 120), ("contact", 200), ("notes", 2000)]:
+            if len(values[key]) > limit or any(ord(c) < 32 and c not in "\n\t" for c in values[key]):
+                raise ValueError(f"Check {key}: text too long or contains unsupported characters.")
+        if not values["title"] or not values["client"]:
+            raise ValueError("Session title and client are required.")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", values["request_id"]):
+            raise ValueError("Form identifier invalid. Reload and try again.")
+        starts = local_timestamp(request.form.get("start", ""), zone)
+        minutes = int(request.form.get("minutes", "0"))
+        if minutes not in (15, 30, 45, 60, 90, 120, 180, 240, 480):
+            raise ValueError("Choose a supported duration.")
+        if not now() < starts <= now() + 366 * 86400:
+            raise ValueError("Choose a future time within the next year.")
+        return values, starts, starts + minutes * 60
+
     @app.post("/bookings")
     def book():
-        values = {key: request.form.get(key, "").strip() for key in ("title", "client", "contact", "notes", "request_id")}
         try:
-            for key, limit in [("title", 120), ("client", 120), ("contact", 200), ("notes", 2000)]:
-                if len(values[key]) > limit or any(ord(c) < 32 and c not in "\n\t" for c in values[key]):
-                    raise ValueError(f"Check {key}: text too long or contains unsupported characters.")
-            if not values["title"] or not values["client"]:
-                raise ValueError("Session title and client are required.")
-            if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", values["request_id"]):
-                raise ValueError("Form identifier invalid. Reload and try again.")
-            starts = local_timestamp(request.form.get("start", ""), zone)
-            minutes = int(request.form.get("minutes", "0"))
-            if minutes not in (15, 30, 45, 60, 90, 120, 180, 240, 480):
-                raise ValueError("Choose a supported duration.")
-            now = int(datetime.now(timezone.utc).timestamp())
-            if not now < starts <= now + 366 * 86400:
-                raise ValueError("Choose a future time within the next year.")
-            ends = starts + minutes * 60
+            values, starts, ends = booking_values()
         except ValueError as exc:
             return desk(str(exc), 422)
         with closing(db()) as conn:
-            # One calendar, one SQLite writer. Check and insert share a transaction.
+            # One calendar: serialize the conflict check and write in either database.
             conn.execute("BEGIN IMMEDIATE")
             duplicate = conn.execute("SELECT id FROM bookings WHERE request_id=?", (values["request_id"],)).fetchone()
             if duplicate:
@@ -169,22 +197,87 @@ def create_app(config=None):
                 return desk("That time overlaps an existing booking. Choose another time or cancel the existing booking first.", 409)
             else:
                 conn.execute("INSERT INTO bookings(title,client,contact,notes,starts,ends,created,request_id) VALUES(?,?,?,?,?,?,?,?)",
-                    (values["title"], values["client"], values["contact"], values["notes"], starts, ends, now, values["request_id"]))
+                    (values["title"], values["client"], values["contact"], values["notes"], starts, ends, now(), values["request_id"]))
                 conn.commit()
                 flash("Booking saved. No invitation or message has been sent.")
         return redirect(url_for("index", day=datetime.fromtimestamp(starts, zone).date().isoformat()), code=303)
 
-    @app.post("/bookings/<int:booking_id>/cancel")
-    def cancel(booking_id):
-        if booking_id > 2**63 - 1:
+    @app.route("/bookings/<int:booking_id>/edit", methods=["GET", "POST"])
+    def edit(booking_id):
+        if booking_id > 2**63-1:
             abort(404)
         with closing(db()) as conn:
             row = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
             if row is None:
                 abort(404)
-            conn.execute("UPDATE bookings SET cancelled=? WHERE id=? AND cancelled IS NULL",
-                (int(datetime.now(timezone.utc).timestamp()), booking_id))
-            conn.commit()
+            if row["cancelled"] is not None:
+                abort(409, "Cancelled bookings cannot be changed.")
+            if request.method == "GET":
+                return desk(editing=row)
+            try:
+                values, starts, ends = booking_values()
+                revision = int(request.form.get("sequence", ""))
+            except ValueError as exc:
+                return desk(str(exc), 422, row)
+            with transaction(conn):
+                row = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+                if row["cancelled"] is not None or row["sequence"] != revision:
+                    return desk("This booking changed. Reload before editing it again.", 409, row)
+                if conn.execute("SELECT id FROM bookings WHERE id<>? AND cancelled IS NULL AND starts<? AND ends>?", (booking_id, ends, starts)).fetchone():
+                    return desk("That time overlaps another booking. The original booking is unchanged.", 409, row)
+                fields = ("title", "client", "contact", "notes")
+                if any(values[k] != row[k] for k in fields) or (starts, ends) != (row["starts"], row["ends"]):
+                    record_change(conn, row, "edited")
+                    conn.execute("UPDATE bookings SET title=?,client=?,contact=?,notes=?,starts=?,ends=?,updated=?,sequence=sequence+1 WHERE id=?",
+                                 tuple(values[k] for k in fields)+(starts, ends, now(), booking_id))
+        flash("Booking updated. Download the revised calendar file; no message sent.")
+        return redirect(url_for("index", day=datetime.fromtimestamp(starts, zone).date().isoformat()), code=303)
+
+    @app.get("/history")
+    def history():
+        query = request.args.get("q", "").strip()
+        state = request.args.get("state", "all")
+        try:
+            page = int(request.args.get("page", "1"))
+            if not 1 <= page <= 1000000 or len(query) > 120 or state not in {"all", "active", "cancelled"}:
+                raise ValueError()
+        except ValueError:
+            abort(400, "Invalid history filter.")
+        clauses, params = ["1=1"], []
+        if state != "all":
+            clauses.append("cancelled IS " + ("NULL" if state == "active" else "NOT NULL"))
+        if query:
+            pattern = "%"+query.lower().replace("!", "!!").replace("%", "!%").replace("_", "!_")+"%"
+            clauses.append("(LOWER(title) LIKE ? ESCAPE '!' OR LOWER(client) LIKE ? ESCAPE '!' OR LOWER(contact) LIKE ? ESCAPE '!')")
+            params.extend([pattern]*3)
+        where = " AND ".join(clauses)
+        with closing(db()) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM bookings WHERE "+where, params).fetchone()[0]
+            bookings = conn.execute("SELECT * FROM bookings WHERE "+where+" ORDER BY starts DESC,id DESC LIMIT ? OFFSET ?", params+[25, (page-1)*25]).fetchall()
+        return render_template("history.html", bookings=bookings, q=query, state=state, page=page, total=total, more=page*25<total, zone=zone.key)
+
+    @app.get("/bookings/<int:booking_id>/history")
+    def changes(booking_id):
+        if booking_id > 2**63-1:
+            abort(404)
+        with closing(db()) as conn:
+            item = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+            if item is None:
+                abort(404)
+            entries = conn.execute("SELECT * FROM booking_history WHERE booking_id=? ORDER BY id DESC LIMIT 100", (booking_id,)).fetchall()
+        return render_template("history.html", item=item, changes=[dict(e) | {"before": json.loads(e["snapshot"])} for e in entries], zone=zone.key)
+
+    @app.post("/bookings/<int:booking_id>/cancel")
+    def cancel(booking_id):
+        if booking_id > 2**63 - 1:
+            abort(404)
+        with closing(db()) as conn, transaction(conn):
+            row = conn.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+            if row is None:
+                abort(404)
+            if row["cancelled"] is None:
+                record_change(conn, row, "cancelled")
+                conn.execute("UPDATE bookings SET cancelled=?,updated=?,sequence=sequence+1 WHERE id=?", (now(), now(), booking_id))
         flash("Booking cancelled. History retained; no message sent.")
         return redirect(url_for("index", day=datetime.fromtimestamp(row["starts"], zone).date().isoformat()), code=303)
 
@@ -198,12 +291,21 @@ def create_app(config=None):
             abort(404)
         utc = lambda stamp: datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Booking Scheduler//Private Pilot//EN", "BEGIN:VEVENT",
-            f"UID:{row['request_id']}@booking-scheduler.local", f"DTSTAMP:{utc(row['cancelled'] or row['created'])}",
+            f"UID:{row['request_id']}@booking-scheduler.local", f"DTSTAMP:{utc(row['updated'] or row['created'])}",
+            f"LAST-MODIFIED:{utc(row['updated'] or row['created'])}",
             f"DTSTART:{utc(row['starts'])}", f"DTEND:{utc(row['ends'])}", "SUMMARY:" + calendar_text(row["title"]),
             "DESCRIPTION:" + calendar_text(f"Client: {row['client']}\n{row['contact']}\n{row['notes']}"),
             "STATUS:" + ("CANCELLED" if row["cancelled"] else "CONFIRMED"),
-            "SEQUENCE:" + ("1" if row["cancelled"] else "0"), "END:VEVENT", "END:VCALENDAR"]
+            f"SEQUENCE:{row['sequence']}", "END:VEVENT", "END:VCALENDAR"]
         return Response(fold_calendar(lines), mimetype="text/calendar",
             headers={"Content-Disposition": f'attachment; filename="booking-{booking_id}.ics"'})
 
+    @app.get("/healthz")
+    def health():
+        with closing(db()) as conn:
+            conn.execute("SELECT id FROM bookings LIMIT 1").fetchone()
+        return {"status": "ok"}
+
+    for error_type in DatabaseError:
+        app.register_error_handler(error_type, lambda error: ("Database temporarily unavailable. Try again shortly.", 503))
     return app
