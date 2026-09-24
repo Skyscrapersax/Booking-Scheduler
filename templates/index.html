@@ -25,4 +25,7 @@
 <label for="start">Start date and time</label><input id="start" name="start" type="datetime-local" value="{{ values.get('start', suggested) }}" required>
 <label for="minutes">Duration</label><select id="minutes" name="minutes">{% for n in [15,30,45,60,90,120,180,240,480] %}<option value="{{ n }}" {% if values.get('minutes','60') == n|string %}selected{% endif %}>{{ n }} minutes</option>{% endfor %}</select>
 <label for="notes">Notes <span>(optional)</span></label><textarea id="notes" name="notes" maxlength="2000" rows="3">{{ values.get('notes', '') }}</textarea><button>Save booking</button><p class="hint">Saves to this desk. Calendar download is manual; no email, invitation, or payment is sent.</p></form></aside></div>
-{% endif %}</main><footer>Booking Scheduler · private pilot · single calendar</footer></body></html>
+{% endif %}</main><footer>Booking Scheduler · private pilot · single calendar</footer>
+<script src="{{ url_for('static', filename='vendor/anime.min.js') }}"></script>
+<script src="{{ url_for('static', filename='motion.js') }}"></script>
+</body></html>

@@ -106,7 +106,10 @@ class BookingTest(unittest.TestCase):
         form = self.form(title="<script>alert(1)</script>", notes="🎵"*100 + "\nBEGIN:VEVENT\nSUMMARY:injected,unsafe;value")
         response = self.client.post("/bookings", data=form, follow_redirects=True)
         self.assertIn(b"&lt;script&gt;", response.data)
-        self.assertNotIn(b"<script>", response.data)
+        self.assertNotIn(b"<script>alert(1)</script>", response.data)
+        allowed = response.data.replace(b'<script src="/static/vendor/anime.min.js"></script>', b"")
+        allowed = allowed.replace(b'<script src="/static/motion.js"></script>', b"")
+        self.assertNotIn(b"<script", allowed)
         data = self.client.get("/bookings/1.ics").data
         self.assertEqual(data.count(b"\r\nBEGIN:VEVENT\r\n"), 1)
         self.assertTrue(all(len(line) <= 75 for line in data.split(b"\r\n")))
