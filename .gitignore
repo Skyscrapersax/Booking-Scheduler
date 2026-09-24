@@ -1,5 +1,10 @@
 __pycache__/
 .venv/
+.vercel/
+public/static/
+*.dump
+*.backup
 instance/
 .env*
 *.sqlite3*
+!.env.example

@@ -5,6 +5,10 @@ repository's Flask welcome screen with persistent bookings, conflict prevention,
 cancellation history and downloadable calendar files. Related Maroon Room UI is
 tracked separately; its booking button has not been wired to this service.
 
+**Current Vercel release:** see [DEPLOYMENT.md](DEPLOYMENT.md). Maroon Room has its
+own request/approval workflow and independent calendar. Both apps support durable
+PostgreSQL hosting; this guide's file paths/Waitress examples describe local use.
+
 ## Run locally
 
 Python 3.11+ and an IANA timezone database are required.
@@ -38,17 +42,20 @@ permissions are not changed by the app.
 One trusted operator team, one calendar, one persistent host. SQLite serializes
 overlap checks with inserts, preventing double booking across concurrent requests.
 Form IDs prevent duplicate submissions. Cancelling frees a slot but retains history;
-to reschedule, cancel and create a new booking. Calendar export is a manual `.ics`
+use **Edit or reschedule** to move an existing booking while preserving its ID and
+previous details. Concurrent/stale edits cannot overwrite a newer revision.
+Search all bookings and cancellations through **History**. Calendar export is a manual `.ics`
 download, not an invitation or two-way sync. No emails, payments or other external
 actions occur. Calendar applications may handle repeated imports differently;
 actual Apple/Google/Outlook import behavior still needs pilot validation.
 
 Run on loopback or behind a private authenticated network. Before remote use,
 set a stable private secret/password, `BOOKING_HOST` to the exact host, keep secure
-cookies enabled, and terminate HTTPS at a trusted reverse proxy. Add edge login
-rate limiting before Internet exposure; this pilot has no per-user accounts,
-password recovery, role separation, or durable login throttling. Do not place the
-SQLite DB on a network filesystem or use multiple independent app replicas.
+cookies enabled, and terminate HTTPS at a trusted reverse proxy. Sign-in is limited
+to ten attempts per address per 15 minutes in the shared database. Forwarded client
+addresses are trusted only in Vercel mode. There are no per-user accounts,
+password recovery or role separation. Do not place SQLite on a network filesystem;
+Vercel instances use one shared PostgreSQL database instead.
 
 Use SQLite's backup API for live backups (copying only the main file while WAL
 is active can omit recent writes). Example using an existing DB path:
