@@ -1,18 +1,18 @@
-// ponytail: check reduced motion once at load; listen for changes if a live OS toggle must stop a running loop
+// ponytail: check reduced motion once at load; listen if an OS toggle must stop motion already running
 if (!matchMedia("(prefers-reduced-motion: reduce)").matches) {
   anime({
-    targets: ".App-logo",
-    rotate: "1turn",
-    easing: "linear",
-    duration: 20000,
-    loop: true,
+    targets: ".signin, .heading, .notice, .error, .booking, .empty",
+    opacity: [0, 1],
+    translateY: [16, 0],
+    delay: anime.stagger(50),
+    duration: 480,
+    easing: "easeOutCubic",
   });
   anime({
-    targets: ".heart",
-    scale: [1, 1.25],
-    direction: "alternate",
-    easing: "easeInOutSine",
-    duration: 700,
-    loop: true,
+    targets: "aside",
+    opacity: [0, 1],
+    translateX: [24, 0],
+    duration: 520,
+    easing: "easeOutCubic",
   });
 }
